@@ -1,0 +1,30 @@
+.DS_Store
+.idea/
+.vscode/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Challenge data and generated artifacts must not enter version control.
+data/train/*
+data/test/*
+!data/train/.gitkeep
+!data/test/.gitkeep
+output/*
+!output/.gitkeep
+reports/*
+!reports/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+
+# Local experiment tracking.
+mlruns/
+wandb/

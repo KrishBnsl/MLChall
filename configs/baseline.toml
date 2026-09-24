@@ -1,0 +1,30 @@
+# These are transparent engineering defaults for a first measured baseline, not optimized values.
+# They must be revisited after the data audit. Every change belongs in the experiment log.
+
+[candidate_generation]
+method = "exact_char_tfidf"
+top_k_per_source = 50
+analyzer = "char_wb"
+ngram_min = 2
+ngram_max = 5
+min_df = 1
+max_features = 500000
+
+[validation]
+n_outer_splits = 5
+n_inner_splits = 4
+seed = 20260925
+metric = "macro_f0.5"
+
+[model]
+family = "logistic_regression"
+class_weight = "balanced"
+max_iter = 2000
+regularization_c = 1.0
+
+[threshold_selection]
+strategy = "inner_oof_grid"
+minimum = 0.05
+maximum = 0.95
+steps = 181
+
