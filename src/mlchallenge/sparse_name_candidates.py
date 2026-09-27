@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import unicodedata
@@ -120,6 +121,7 @@ def _generate_group_chunks(
     source: str,
     country: str,
     config: SparseNameConfig,
+    resume: bool,
 ) -> list[Path]:
     query, target = _load_country_group(
         connection,
@@ -180,6 +182,10 @@ def _generate_group_chunks(
     written: list[Path] = []
     for batch_number, start in enumerate(range(0, len(query), config.query_batch_size)):
         stop = min(start + config.query_batch_size, len(query))
+        output = chunk_directory / f"{source}_{country}_{batch_number:05d}.parquet"
+        if resume and output.is_file():
+            written.append(output)
+            continue
         query_name_counts = name_vectorizer.transform(query_names.iloc[start:stop])
         query_name_matrix = name_transformer.transform(query_name_counts).astype(np.float32)
         query_matrix = query_name_matrix
@@ -222,7 +228,6 @@ def _generate_group_chunks(
                 "char_name_score": similarities.data.astype(np.float32),
             }
         )
-        output = chunk_directory / f"{source}_{country}_{batch_number:05d}.parquet"
         _write_frame_parquet(connection, frame, output)
         written.append(output)
     return written
@@ -319,6 +324,82 @@ def _candidate_metrics(
     return report
 
 
+def merge_candidate_artifacts(
+    candidate_paths: list[str | Path],
+    output_parquet: str | Path,
+    report_path: str | Path,
+    *,
+    split_directory: str | Path,
+    runtime: DuckDBRuntime,
+    temp_directory: str | Path,
+) -> dict[str, Any]:
+    """Union compatible blocker artifacts and retain the strongest evidence per pair."""
+
+    if len(candidate_paths) < 2:
+        raise ValueError("at least two candidate artifacts are required")
+    inputs = [Path(path).resolve() for path in candidate_paths]
+    for path in inputs:
+        if not path.is_file():
+            raise FileNotFoundError(f"candidate artifact is missing: {path}")
+    split_root = Path(split_directory).resolve()
+    output = Path(output_parquet).resolve()
+    report_output = Path(report_path).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report_output.parent.mkdir(parents=True, exist_ok=True)
+    input_sql = ", ".join(_sql_path(path) for path in inputs)
+    connection = connect_out_of_core(temp_directory=temp_directory, runtime=runtime)
+    try:
+        connection.execute(
+            f"""
+            COPY (
+                SELECT
+                    source1_entity_id,
+                    candidate_entity_id,
+                    candidate_source,
+                    max(coalesce(exact_name, 0)) AS exact_name,
+                    max(coalesce(exact_address, 0)) AS exact_address,
+                    max(coalesce(fuzzy_score, 0.0)) AS fuzzy_score,
+                    max(coalesce(shared_blocking_keys, 0)) AS shared_blocking_keys,
+                    max(coalesce(char_name_score, 0.0)) AS char_name_score
+                FROM read_parquet([{input_sql}], union_by_name=true)
+                GROUP BY source1_entity_id, candidate_entity_id, candidate_source
+            ) TO {_sql_path(output)}
+            (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)
+            """
+        )
+        duplicate_pairs = connection.execute(
+            """
+            SELECT count(*) - count(DISTINCT (source1_entity_id, candidate_entity_id))
+            FROM read_parquet(?)
+            """,
+            [str(output)],
+        ).fetchone()[0]
+        if duplicate_pairs:
+            raise RuntimeError(f"candidate merge wrote {duplicate_pairs} duplicate pairs")
+        report = _candidate_metrics(connection, output, split_root)
+    finally:
+        connection.close()
+    report.update(
+        {
+            "blocking_version": 3,
+            "method": "evidence_preserving_candidate_union",
+            "duplicate_pairs": int(duplicate_pairs),
+            "runtime": asdict(runtime),
+            "inputs": [
+                {"path": str(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
+                for path in inputs
+            ],
+            "candidate_artifact": {
+                "path": str(output),
+                "bytes": output.stat().st_size,
+                "sha256": sha256_file(output),
+            },
+        }
+    )
+    report_output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return report
+
+
 def generate_sparse_name_candidates(
     split_directory: str | Path,
     output_parquet: str | Path,
@@ -328,6 +409,7 @@ def generate_sparse_name_candidates(
     runtime: DuckDBRuntime,
     temp_directory: str | Path,
     union_candidate_path: str | Path | None = None,
+    resume: bool = True,
 ) -> dict[str, Any]:
     """Generate name candidates and optionally union them with an earlier blocker."""
 
@@ -335,13 +417,55 @@ def generate_sparse_name_candidates(
     output = Path(output_parquet).resolve()
     report_output = Path(report_path).resolve()
     chunk_directory = output.parent / f".{output.stem}_chunks"
-    if chunk_directory.exists():
+    input_paths = {
+        name: split_root / f"{name}.parquet" for name in ("source1", "source2", "source3")
+    }
+    for path in input_paths.values():
+        if not path.is_file():
+            raise FileNotFoundError(f"required split artifact is missing: {path}")
+    earlier = Path(union_candidate_path).resolve() if union_candidate_path else None
+    if earlier is not None and not earlier.is_file():
+        raise FileNotFoundError(f"union candidate artifact is missing: {earlier}")
+    signature_payload = {
+        "version": 3,
+        "config": asdict(config),
+        "inputs": {name: sha256_file(path) for name, path in input_paths.items()},
+        "union_candidates": sha256_file(earlier) if earlier is not None else None,
+    }
+    signature = hashlib.sha256(
+        json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    resume_manifest = chunk_directory / "resume.json"
+    if chunk_directory.exists() and not resume:
         shutil.rmtree(chunk_directory)
-    chunk_directory.mkdir(parents=True)
+    if chunk_directory.exists():
+        if not resume_manifest.is_file():
+            raise RuntimeError(
+                f"existing sparse chunks have no resume manifest: {chunk_directory}; "
+                "use no-resume explicitly"
+            )
+        prior = json.loads(resume_manifest.read_text(encoding="utf-8"))
+        if prior.get("signature") != signature:
+            raise RuntimeError(
+                f"existing sparse chunks have a different configuration: {chunk_directory}; "
+                "use no-resume explicitly"
+            )
+    else:
+        chunk_directory.mkdir(parents=True)
+        resume_manifest.write_text(
+            json.dumps(
+                {"signature": signature, "payload": signature_payload},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     report_output.parent.mkdir(parents=True, exist_ok=True)
     connection = connect_out_of_core(temp_directory=temp_directory, runtime=runtime)
     chunks: list[Path] = []
+    completed = False
     try:
         countries = connection.execute(
             "SELECT DISTINCT country FROM read_parquet(?) ORDER BY country",
@@ -357,6 +481,7 @@ def generate_sparse_name_candidates(
                         source=source,
                         country=str(country),
                         config=config,
+                        resume=resume,
                     )
                 )
         if not chunks:
@@ -412,9 +537,10 @@ def generate_sparse_name_candidates(
             """
         )
         report = _candidate_metrics(connection, output, split_root)
+        completed = True
     finally:
         connection.close()
-        if chunk_directory.exists():
+        if completed and chunk_directory.exists():
             shutil.rmtree(chunk_directory)
     report.update(
         {
@@ -429,6 +555,7 @@ def generate_sparse_name_candidates(
             "union_candidate_path": (
                 str(Path(union_candidate_path).resolve()) if union_candidate_path else None
             ),
+            "resume_signature": signature,
             "candidate_artifact": {
                 "path": str(output),
                 "bytes": output.stat().st_size,

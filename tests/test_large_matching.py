@@ -12,6 +12,7 @@ from mlchallenge.large_data import DuckDBRuntime
 from mlchallenge.large_matching import (
     MatcherConfig,
     SamplingConfig,
+    build_mining_pool,
     build_training_sample,
     evaluate_at_threshold,
     score_candidates,
@@ -106,6 +107,18 @@ def _matching_fixture(root) -> tuple[object, object]:
 def test_large_matching_pipeline_end_to_end(tmp_path) -> None:
     split, candidates = _matching_fixture(tmp_path)
     runtime = DuckDBRuntime(memory_limit="256MB", threads=1, max_temp_directory_size="1GB")
+    mining_pool = tmp_path / "mining_pool.parquet"
+    mining_pool_report = build_mining_pool(
+        candidates,
+        mining_pool,
+        tmp_path / "mining_pool.json",
+        candidates_per_source=1,
+        runtime=runtime,
+        temp_directory=tmp_path / "mining_pool_tmp",
+    )
+    assert mining_pool_report["rows"] == 60
+    assert mining_pool_report["candidate_count_per_entity_source"]["max"] == 1
+
     sample = tmp_path / "training_sample.parquet"
     sample_report = build_training_sample(
         candidates,
@@ -203,9 +216,7 @@ def test_large_matching_pipeline_end_to_end(tmp_path) -> None:
         temp_directory=tmp_path / "error_tmp",
     )
     assert diagnostics["artifacts"]["pair_errors"]["bytes"] > 0
-    cardinality_slice = pd.read_csv(
-        diagnostics["artifacts"]["slices"]["truth_cardinality"]["path"]
-    )
+    cardinality_slice = pd.read_csv(diagnostics["artifacts"]["slices"]["truth_cardinality"]["path"])
     singleton_score = cardinality_slice.loc[
         cardinality_slice["segment"].astype(str) == "0", "macro_f0_5"
     ].iloc[0]

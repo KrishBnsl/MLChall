@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -569,6 +570,181 @@ def create_experiment_splits(
         },
     }
     metadata_path = output / "experiment_split_metadata.json"
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return metadata
+
+
+def _link_or_copy(source: Path, destination: Path) -> None:
+    """Materialize a small split artifact without duplicating bytes when possible."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def create_scale_matched_evaluation_splits(
+    experiment_split_root: str | Path,
+    output_root: str | Path,
+    *,
+    runtime: DuckDBRuntime,
+    temp_directory: str | Path,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Create tuning and holdout views with the full target pool as distractors.
+
+    Query rows and labels remain entity-disjoint and unchanged.  Only the candidate universe is
+    enlarged: targets owned by other query partitions are included as known nonmatches.  This
+    exposes scale-sensitive blocking and false-positive behavior without leaking held-out labels
+    into model fitting.
+    """
+
+    experiment_root = Path(experiment_split_root).resolve()
+    source_paths: dict[str, dict[str, Path]] = {}
+    for split_name in EXPERIMENT_SPLIT_NAMES:
+        split_directory = experiment_root / split_name
+        paths = {
+            name: split_directory / f"{name}.parquet"
+            for name in ("source1", "source2", "source3", "ground_truth")
+        }
+        for path in paths.values():
+            if not path.is_file():
+                raise FileNotFoundError(f"required experiment split artifact is missing: {path}")
+        source_paths[split_name] = paths
+
+    output = Path(output_root).resolve()
+    if output.exists() and any(output.iterdir()):
+        if not force:
+            raise FileExistsError(
+                f"scale-matched output already exists and is not empty: {output}; "
+                "use force explicitly"
+            )
+        shutil.rmtree(output)
+    output.mkdir(parents=True, exist_ok=True)
+
+    connection = connect_out_of_core(temp_directory=temp_directory, runtime=runtime)
+    target_pool_directory = output / "target_pool"
+    target_pool_directory.mkdir(parents=True, exist_ok=True)
+    artifacts: list[Path] = []
+    verification: dict[str, int] = {}
+    summary: dict[str, Any] = {"target_pool": {}, "evaluation_splits": {}}
+    try:
+        for source in ("source2", "source3"):
+            inputs = [source_paths[name][source] for name in EXPERIMENT_SPLIT_NAMES]
+            input_sql = ", ".join(_sql_path(path) for path in inputs)
+            target_output = target_pool_directory / f"{source}.parquet"
+            _copy_to_parquet(
+                connection,
+                f"SELECT * FROM read_parquet([{input_sql}]) ORDER BY entity_id",
+                target_output,
+            )
+            duplicate_count = connection.execute(
+                """
+                SELECT count(*) - count(DISTINCT entity_id)
+                FROM read_parquet(?)
+                """,
+                [str(target_output)],
+            ).fetchone()[0]
+            verification[f"duplicate_{source}_entity_ids"] = int(duplicate_count)
+            summary["target_pool"][source] = {
+                "records": int(
+                    connection.execute(
+                        "SELECT count(*) FROM read_parquet(?)", [str(target_output)]
+                    ).fetchone()[0]
+                )
+            }
+            artifacts.append(target_output)
+
+        if any(verification.values()):
+            raise RuntimeError(f"scale-matched target verification failed: {verification}")
+
+        for split_name in ("tuning", "holdout"):
+            split_output = output / split_name
+            _link_or_copy(source_paths[split_name]["source1"], split_output / "source1.parquet")
+            _link_or_copy(
+                source_paths[split_name]["ground_truth"],
+                split_output / "ground_truth.parquet",
+            )
+            _link_or_copy(
+                target_pool_directory / "source2.parquet", split_output / "source2.parquet"
+            )
+            _link_or_copy(
+                target_pool_directory / "source3.parquet", split_output / "source3.parquet"
+            )
+            split_artifacts = [
+                split_output / f"{name}.parquet"
+                for name in ("source1", "source2", "source3", "ground_truth")
+            ]
+            artifacts.extend(split_artifacts)
+            missing_positives = connection.execute(
+                """
+                WITH truth AS (
+                    SELECT unnest(string_split(matched_entity_ids, ',')) AS target_entity_id
+                    FROM read_parquet(?)
+                    WHERE coalesce(trim(matched_entity_ids), '') <> ''
+                ), targets AS (
+                    SELECT entity_id FROM read_parquet(?)
+                    UNION ALL
+                    SELECT entity_id FROM read_parquet(?)
+                )
+                SELECT count(*)
+                FROM truth
+                ANTI JOIN targets ON truth.target_entity_id = targets.entity_id
+                """,
+                [
+                    str(split_output / "ground_truth.parquet"),
+                    str(split_output / "source2.parquet"),
+                    str(split_output / "source3.parquet"),
+                ],
+            ).fetchone()[0]
+            verification[f"{split_name}_missing_positive_targets"] = int(missing_positives)
+            query_count = connection.execute(
+                "SELECT count(*) FROM read_parquet(?)",
+                [str(split_output / "source1.parquet")],
+            ).fetchone()[0]
+            owned_target_count = sum(
+                connection.execute(
+                    "SELECT count(*) FROM read_parquet(?)",
+                    [str(source_paths[split_name][source])],
+                ).fetchone()[0]
+                for source in ("source2", "source3")
+            )
+            full_target_count = sum(
+                summary["target_pool"][source]["records"] for source in ("source2", "source3")
+            )
+            summary["evaluation_splits"][split_name] = {
+                "query_records": int(query_count),
+                "target_records": int(full_target_count),
+                "owned_target_records": int(owned_target_count),
+                "distractor_target_records": int(full_target_count - owned_target_count),
+            }
+    finally:
+        connection.close()
+
+    failures = {key: value for key, value in verification.items() if value}
+    if failures:
+        raise RuntimeError(f"scale-matched evaluation verification failed: {failures}")
+
+    metadata = {
+        "scale_matched_version": 1,
+        "purpose": "entity_disjoint_evaluation_with_full_target_distractor_pool",
+        "engine": {"name": "duckdb", "version": duckdb.__version__},
+        "runtime": asdict(runtime),
+        "experiment_split_root": str(experiment_root),
+        "verification": verification,
+        "summary": summary,
+        "artifacts": {
+            str(path.relative_to(output)): {
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+            for path in artifacts
+        },
+    }
+    metadata_path = output / "scale_matched_metadata.json"
     metadata_path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

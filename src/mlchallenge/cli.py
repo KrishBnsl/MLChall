@@ -19,6 +19,7 @@ from mlchallenge.large_data import DuckDBRuntime, audit_dataset_out_of_core, wri
 from mlchallenge.large_matching import (
     MatcherConfig,
     SamplingConfig,
+    build_mining_pool,
     build_training_sample,
     evaluate_at_threshold,
     prepare_test_split,
@@ -32,12 +33,17 @@ from mlchallenge.scalable_candidates import (
     generate_candidates_out_of_core,
     generate_partitioned_candidates,
 )
-from mlchallenge.sparse_name_candidates import SparseNameConfig, generate_sparse_name_candidates
+from mlchallenge.sparse_name_candidates import (
+    SparseNameConfig,
+    generate_sparse_name_candidates,
+    merge_candidate_artifacts,
+)
 from mlchallenge.splits import (
     ExperimentSplitConfig,
     SplitConfig,
     create_development_splits,
     create_experiment_splits,
+    create_scale_matched_evaluation_splits,
 )
 from mlchallenge.submission import validate_submission_frames
 
@@ -115,6 +121,18 @@ def _make_experiment_splits(args: argparse.Namespace) -> int:
     return 0
 
 
+def _make_scale_evaluation_splits(args: argparse.Namespace) -> int:
+    metadata = create_scale_matched_evaluation_splits(
+        args.experiment_split_root,
+        args.output_root,
+        runtime=_runtime(args),
+        temp_directory=args.temp_directory,
+        force=args.force,
+    )
+    print(json.dumps(metadata, indent=2, sort_keys=True))
+    return 0
+
+
 def _build_candidates(args: argparse.Namespace) -> int:
     generator = (
         generate_partitioned_candidates if args.partitioned else generate_candidates_out_of_core
@@ -160,6 +178,20 @@ def _build_sparse_name_candidates(args: argparse.Namespace) -> int:
         runtime=_runtime(args),
         temp_directory=args.temp_directory,
         union_candidate_path=args.union_candidates,
+        resume=not args.no_resume,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _merge_candidates(args: argparse.Namespace) -> int:
+    report = merge_candidate_artifacts(
+        args.inputs,
+        args.output,
+        args.report,
+        split_directory=args.split_directory,
+        runtime=_runtime(args),
+        temp_directory=args.temp_directory,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
@@ -193,6 +225,19 @@ def _build_training_sample(args: argparse.Namespace) -> int:
         runtime=_runtime(args),
         temp_directory=args.temp_directory,
         mining_scores_path=args.mining_scores,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _build_mining_pool(args: argparse.Namespace) -> int:
+    report = build_mining_pool(
+        args.candidates,
+        args.output,
+        args.report,
+        candidates_per_source=args.candidates_per_source,
+        runtime=_runtime(args),
+        temp_directory=args.temp_directory,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
@@ -401,9 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     experiment_splits_parser.add_argument(
         "--parent-split-directory", default="artifacts/splits/train"
     )
-    experiment_splits_parser.add_argument(
-        "--output-root", default="artifacts/experiment_splits_v2"
-    )
+    experiment_splits_parser.add_argument("--output-root", default="artifacts/experiment_splits_v2")
     experiment_splits_parser.add_argument("--fit-fraction", type=float, default=8.0 / 9.0)
     experiment_splits_parser.add_argument("--tuning-fraction", type=float, default=1.0 / 18.0)
     experiment_splits_parser.add_argument("--holdout-fraction", type=float, default=1.0 / 18.0)
@@ -414,6 +457,23 @@ def build_parser() -> argparse.ArgumentParser:
     experiment_splits_parser.add_argument("--threads", type=int, default=4)
     experiment_splits_parser.add_argument("--force", action="store_true")
     experiment_splits_parser.set_defaults(func=_make_experiment_splits)
+
+    scale_evaluation_parser = subparsers.add_parser(
+        "make-scale-evaluation-splits",
+        help="evaluate held-out queries against the full target pool as realistic distractors",
+    )
+    scale_evaluation_parser.add_argument(
+        "--experiment-split-root", default="artifacts/experiment_splits_v2"
+    )
+    scale_evaluation_parser.add_argument(
+        "--output-root", default="artifacts/scale_evaluation_splits_v3"
+    )
+    scale_evaluation_parser.add_argument("--temp-directory", default="artifacts/duckdb_tmp")
+    scale_evaluation_parser.add_argument("--memory-limit", default="3GB")
+    scale_evaluation_parser.add_argument("--max-temp-size", default="8GB")
+    scale_evaluation_parser.add_argument("--threads", type=int, default=4)
+    scale_evaluation_parser.add_argument("--force", action="store_true")
+    scale_evaluation_parser.set_defaults(func=_make_scale_evaluation_splits)
 
     candidate_parser = subparsers.add_parser(
         "build-candidates",
@@ -459,7 +519,22 @@ def build_parser() -> argparse.ArgumentParser:
     sparse_parser.add_argument("--minimum-similarity", type=float, default=0.10)
     sparse_parser.add_argument("--multiplication-threads", type=int, default=2)
     sparse_parser.add_argument("--address-weight", type=float, default=0.35)
+    sparse_parser.add_argument("--no-resume", action="store_true")
     sparse_parser.set_defaults(func=_build_sparse_name_candidates)
+
+    merge_parser = subparsers.add_parser(
+        "merge-candidates",
+        help="union blocker artifacts while retaining the strongest evidence for each pair",
+    )
+    merge_parser.add_argument("--inputs", nargs="+", required=True)
+    merge_parser.add_argument("--split-directory", required=True)
+    merge_parser.add_argument("--output", required=True)
+    merge_parser.add_argument("--report", required=True)
+    merge_parser.add_argument("--temp-directory", default="artifacts/duckdb_tmp")
+    merge_parser.add_argument("--memory-limit", default="3GB")
+    merge_parser.add_argument("--max-temp-size", default="8GB")
+    merge_parser.add_argument("--threads", type=int, default=4)
+    merge_parser.set_defaults(func=_merge_candidates)
 
     prepare_test_parser = subparsers.add_parser(
         "prepare-test", help="convert official test TSV files to pipeline Parquet inputs"
@@ -492,6 +567,20 @@ def build_parser() -> argparse.ArgumentParser:
     sample_parser.add_argument("--max-temp-size", default="8GB")
     sample_parser.add_argument("--threads", type=int, default=4)
     sample_parser.set_defaults(func=_build_training_sample)
+
+    mining_pool_parser = subparsers.add_parser(
+        "build-mining-pool",
+        help="select a bounded top candidate pool for model-hard-negative scoring",
+    )
+    mining_pool_parser.add_argument("--candidates", required=True)
+    mining_pool_parser.add_argument("--output", required=True)
+    mining_pool_parser.add_argument("--report", required=True)
+    mining_pool_parser.add_argument("--candidates-per-source", type=int, default=20)
+    mining_pool_parser.add_argument("--temp-directory", default="artifacts/duckdb_tmp")
+    mining_pool_parser.add_argument("--memory-limit", default="3GB")
+    mining_pool_parser.add_argument("--max-temp-size", default="8GB")
+    mining_pool_parser.add_argument("--threads", type=int, default=4)
+    mining_pool_parser.set_defaults(func=_build_mining_pool)
 
     train_parser = subparsers.add_parser(
         "train-matcher", help="fit calibrated group-disjoint OOF and final pair matchers"

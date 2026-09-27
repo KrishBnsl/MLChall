@@ -8,29 +8,38 @@ fair-play rules.
 
 ## Current status
 
-Phase 0 foundations are implemented. The challenge dataset and official student resource bundle
-have not been provided yet, so no data profile, validation split, trained model, threshold, runtime
-estimate, or performance claim exists. Those omissions are deliberate.
+The official student resource bundle has been audited and the large-data pipeline is implemented.
+The best completed entity-group OOF tuning estimate is **0.973524 macro F0.5** with LightGBM and
+two rounds of hard-example mining. This is not an official test score. The official test labels are
+not available, and 0.99 has not been achieved or claimed.
 
-Implemented now:
+Implemented and verified:
 
 - strict TSV and identifier contracts;
 - deterministic text normalization with no internet lookup;
-- exact character TF-IDF candidate generation suitable as a transparent baseline;
-- pairwise similarity features and a conservative baseline classifier;
+- deterministic entity-disjoint fit/tuning/holdout partitions;
+- country/source/query-batch rule blocking with resumable artifacts;
+- resumable hashed character TF-IDF name/address retrieval and blocker union;
+- compact structured, frequency, rank, token, edit, and address-number features;
+- deterministic hard-negative sampling and iterative model-hard-example mining;
+- HistGradientBoosting, LightGBM, XGBoost, and CatBoost comparison support;
+- global and guarded source-specific threshold evaluation;
 - entity-level macro F0.5 scoring, including correct singleton behavior;
-- group-disjoint fold-manifest construction to prevent cross-source entity leakage;
+- scale-matched evaluation views that add the full target pool only as distractors;
 - data fingerprinting and audit reports;
 - output preflight validation;
-- synthetic unit tests for correctness properties;
+- synthetic regression tests for correctness, leakage, resume, and diagnostic properties;
 - decision, validation, experiment, and risk documentation.
 
-Not yet claimed or selected:
+Selected production design:
 
-- dataset-specific blocking limits or approximate-nearest-neighbor technology;
-- final feature set, model family, calibration method, or threshold;
-- final cross-validation design parameters;
-- leaderboard score or expected final-validation score.
+- top-100-per-source rule plus sparse TF-IDF candidate union;
+- calibrated LightGBM with 350 estimators and 63 leaves;
+- one global threshold (source-specific thresholds failed the minimum-gain guard);
+- no neural network: the structured tree model is simpler, faster, and better supported by the
+  validation evidence.
+
+See `docs/MODEL_SELECTION_V3.md` for the model-family, blocking, mining, and complexity gates.
 
 ## Repository layout
 
@@ -69,10 +78,10 @@ validator remains the final authority; the repository's preflight checks are add
 
 ## Reproducible setup
 
-The lock file is generated with `uv` and should be used when available:
+The lock file is generated with `uv` and includes an optional benchmark extra:
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra benchmark
 uv run pytest
 ```
 
@@ -84,19 +93,22 @@ python3 -m venv .venv
 .venv/bin/python -m pytest
 ```
 
-## First commands after data arrival
+## Large-data workflow
 
 ```bash
 uv run mlchallenge audit --data-root data --output reports/data_audit.json
-uv run mlchallenge make-folds \
-  --data-root data \
-  --output artifacts/fold_manifest.tsv \
-  --n-splits 5 \
-  --seed 20260925
+uv run mlchallenge make-splits --data-root student_resource/dataset
+uv run mlchallenge make-experiment-splits \
+  --parent-split-directory artifacts/splits/train \
+  --output-root artifacts/experiment_splits_v2
+uv run mlchallenge make-scale-evaluation-splits \
+  --experiment-split-root artifacts/experiment_splits_v2 \
+  --output-root artifacts/scale_evaluation_splits_v3
 ```
 
-The audit must be reviewed before running experiments. In particular, candidate counts, memory
-strategy, fold counts, and model search space will be chosen from measured dataset properties.
+Run `mlchallenge --help` or a subcommand's `--help` for the bounded-memory candidate, sampling,
+training, scoring, threshold, error-analysis, submission, and preflight commands. Large artifacts
+are intentionally ignored by Git and every report fingerprints its inputs and outputs.
 
 ## Validation principles
 
@@ -104,8 +116,8 @@ strategy, fold counts, and model search space will be chosen from measured datas
 - Fit candidate indices, vectorizers, feature transformations, calibration, and thresholds only
   inside their permitted training partition.
 - Measure blocking recall separately because the matcher cannot recover missed candidates.
-- Keep threshold and hyperparameter selection inside inner validation; report only untouched outer
-  fold performance as the model-selection estimate.
+- Select model structure with entity-group OOF predictions, tune the final fit-only model on the
+  scale-matched tuning queries, and evaluate the frozen pipeline once on holdout.
 - Preserve empty predictions. Never force one match per Source 1 entity.
 - Do not use leaderboard feedback as a training label or repeatedly tune to it.
 - Fingerprint raw data and version every experiment configuration.
@@ -118,4 +130,3 @@ Only the supplied challenge data may provide business identity evidence. The pip
 business registries, geocoders, search engines, entity-resolution services, or any other external
 lookup. If a pretrained model is later evaluated, its license and provenance must be documented and
 must comply with the stated MIT/Apache 2.0 and parameter-count restrictions.
-

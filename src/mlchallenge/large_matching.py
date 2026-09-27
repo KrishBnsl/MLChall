@@ -540,6 +540,90 @@ def prepare_test_split(
     return report
 
 
+def build_mining_pool(
+    candidates_path: str | Path,
+    output_path: str | Path,
+    report_path: str | Path,
+    *,
+    candidates_per_source: int,
+    runtime: DuckDBRuntime,
+    temp_directory: str | Path,
+) -> dict[str, Any]:
+    """Select a deterministic, bounded candidate pool for model-hard-negative scoring."""
+
+    if candidates_per_source < 1:
+        raise ValueError("candidates_per_source must be positive")
+    candidates = Path(candidates_path).resolve()
+    if not candidates.is_file():
+        raise FileNotFoundError(f"candidate artifact is missing: {candidates}")
+    output = Path(output_path).resolve()
+    report_output = Path(report_path).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report_output.parent.mkdir(parents=True, exist_ok=True)
+    connection = connect_out_of_core(temp_directory=temp_directory, runtime=runtime)
+    try:
+        columns = _candidate_columns(connection, candidates)
+        exact_name = _optional_candidate_column(columns, "exact_name", "0")
+        exact_address = _optional_candidate_column(columns, "exact_address", "0")
+        fuzzy_score = _optional_candidate_column(columns, "fuzzy_score", "0.0")
+        shared_keys = _optional_candidate_column(columns, "shared_blocking_keys", "0")
+        retrieval_score = _optional_candidate_column(columns, "char_name_score", "0.0")
+        connection.execute(
+            f"""
+            COPY (
+                SELECT * EXCLUDE (mining_rank)
+                FROM (
+                    SELECT candidates.*,
+                           row_number() OVER (
+                               PARTITION BY source1_entity_id, candidate_source
+                               ORDER BY
+                                   {exact_name} DESC,
+                                   {exact_address} DESC,
+                                   greatest({retrieval_score}, {fuzzy_score}) DESC,
+                                   {shared_keys} DESC,
+                                   candidate_entity_id
+                           ) AS mining_rank
+                    FROM read_parquet({_sql_path(candidates)}) candidates
+                ) ranked
+                WHERE mining_rank <= {candidates_per_source}
+            ) TO {_sql_path(output)}
+            (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)
+            """
+        )
+        row = connection.execute(
+            f"""
+            SELECT sum(candidate_count), count(DISTINCT source1_entity_id),
+                   min(candidate_count), max(candidate_count), avg(candidate_count)
+            FROM (
+                SELECT source1_entity_id, candidate_source, count(*) AS candidate_count
+                FROM read_parquet({_sql_path(output)})
+                GROUP BY source1_entity_id, candidate_source
+            ) counts
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+    report = {
+        "candidates_per_source": candidates_per_source,
+        "rows": int(row[0]),
+        "entities": int(row[1]),
+        "candidate_count_per_entity_source": {
+            "min": int(row[2]),
+            "max": int(row[3]),
+            "mean": float(row[4]),
+        },
+        "runtime": asdict(runtime),
+        "input": {"path": str(candidates), "sha256": sha256_file(candidates)},
+        "artifact": {
+            "path": str(output),
+            "bytes": output.stat().st_size,
+            "sha256": sha256_file(output),
+        },
+    }
+    report_output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return report
+
+
 def build_training_sample(
     candidates_path: str | Path,
     split_directory: str | Path,

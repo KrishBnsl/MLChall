@@ -2,19 +2,26 @@ from __future__ import annotations
 
 import duckdb
 import pandas as pd
+import pytest
 
+import mlchallenge.sparse_name_candidates as sparse_module
 from mlchallenge.large_data import DuckDBRuntime
 from mlchallenge.scalable_candidates import (
     BlockingConfig,
     generate_candidates_out_of_core,
     generate_partitioned_candidates,
 )
-from mlchallenge.sparse_name_candidates import SparseNameConfig, generate_sparse_name_candidates
+from mlchallenge.sparse_name_candidates import (
+    SparseNameConfig,
+    generate_sparse_name_candidates,
+    merge_candidate_artifacts,
+)
 from mlchallenge.splits import (
     ExperimentSplitConfig,
     SplitConfig,
     create_development_splits,
     create_experiment_splits,
+    create_scale_matched_evaluation_splits,
 )
 
 
@@ -135,6 +142,19 @@ def test_out_of_core_split_creation_is_complete_and_leakage_free(tmp_path) -> No
     assert sparse_output.is_file()
     assert sparse_report_path.is_file()
 
+    merged_output = tmp_path / "validation_merged.parquet"
+    merged_report = merge_candidate_artifacts(
+        [candidate_path, sparse_output],
+        merged_output,
+        tmp_path / "validation_merged.json",
+        split_directory=output_root / "validation",
+        runtime=DuckDBRuntime(memory_limit="256MB", threads=1, max_temp_directory_size="1GB"),
+        temp_directory=tmp_path / "merge_tmp",
+    )
+    assert merged_report["positive_pair_recall"] == 1.0
+    assert merged_report["duplicate_pairs"] == 0
+    assert merged_output.is_file()
+
 
 def test_fresh_nested_holdout_and_partitioned_blocker(tmp_path) -> None:
     data_root = tmp_path / "dataset"
@@ -187,3 +207,133 @@ def test_fresh_nested_holdout_and_partitioned_blocker(tmp_path) -> None:
     assert report["positive_pair_recall"] == 1.0
     assert report["duplicate_pairs"] == 0
     assert candidates.is_file()
+
+
+def test_scale_matched_views_keep_queries_held_out_and_add_all_targets(tmp_path) -> None:
+    data_root = tmp_path / "dataset"
+    _write_split_fixture(data_root)
+    runtime = DuckDBRuntime(memory_limit="256MB", threads=1, max_temp_directory_size="1GB")
+    original = tmp_path / "original_splits"
+    create_development_splits(
+        data_root,
+        original,
+        config=SplitConfig(
+            train_fraction=0.50,
+            validation_fraction=0.25,
+            local_test_fraction=0.25,
+            seed=17,
+        ),
+        runtime=runtime,
+        temp_directory=tmp_path / "original_tmp",
+    )
+    nested = tmp_path / "experiment_splits"
+    create_experiment_splits(
+        original / "train",
+        nested,
+        config=ExperimentSplitConfig(
+            fit_fraction=0.50,
+            tuning_fraction=0.25,
+            holdout_fraction=0.25,
+            seed=19,
+        ),
+        runtime=runtime,
+        temp_directory=tmp_path / "nested_tmp",
+    )
+
+    scaled = tmp_path / "scale_matched"
+    metadata = create_scale_matched_evaluation_splits(
+        nested,
+        scaled,
+        runtime=runtime,
+        temp_directory=tmp_path / "scaled_tmp",
+    )
+    assert all(value == 0 for value in metadata["verification"].values())
+
+    connection = duckdb.connect()
+    expected_source2 = sum(
+        connection.execute(
+            "SELECT count(*) FROM read_parquet(?)",
+            [str(nested / split / "source2.parquet")],
+        ).fetchone()[0]
+        for split in ("fit", "tuning", "holdout")
+    )
+    actual_source2 = connection.execute(
+        "SELECT count(*) FROM read_parquet(?)",
+        [str(scaled / "holdout" / "source2.parquet")],
+    ).fetchone()[0]
+    assert actual_source2 == expected_source2
+
+    expected_queries = connection.execute(
+        "SELECT count(*) FROM read_parquet(?)",
+        [str(nested / "holdout" / "source1.parquet")],
+    ).fetchone()[0]
+    actual_queries = connection.execute(
+        "SELECT count(*) FROM read_parquet(?)",
+        [str(scaled / "holdout" / "source1.parquet")],
+    ).fetchone()[0]
+    assert actual_queries == expected_queries
+    assert metadata["summary"]["evaluation_splits"]["holdout"]["distractor_target_records"] > 0
+
+
+def test_sparse_candidate_build_resumes_completed_batches(tmp_path, monkeypatch) -> None:
+    data_root = tmp_path / "dataset"
+    _write_split_fixture(data_root)
+    runtime = DuckDBRuntime(memory_limit="256MB", threads=1, max_temp_directory_size="1GB")
+    splits = tmp_path / "splits"
+    create_development_splits(
+        data_root,
+        splits,
+        config=SplitConfig(
+            train_fraction=0.50,
+            validation_fraction=0.25,
+            local_test_fraction=0.25,
+            seed=17,
+        ),
+        runtime=runtime,
+        temp_directory=tmp_path / "split_tmp",
+    )
+    output = tmp_path / "resumable_candidates.parquet"
+    config = SparseNameConfig(
+        top_k_per_source=3,
+        ngram_min=2,
+        ngram_max=3,
+        n_features=1024,
+        query_batch_size=1,
+        minimum_similarity=0.0,
+        multiplication_threads=1,
+    )
+    original_matmul = sparse_module.sp_matmul_topn
+    calls = 0
+
+    def fail_after_first_batch(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("synthetic interruption")
+        return original_matmul(*args, **kwargs)
+
+    monkeypatch.setattr(sparse_module, "sp_matmul_topn", fail_after_first_batch)
+    with pytest.raises(RuntimeError, match="synthetic interruption"):
+        generate_sparse_name_candidates(
+            splits / "validation",
+            output,
+            tmp_path / "interrupted_report.json",
+            config=config,
+            runtime=runtime,
+            temp_directory=tmp_path / "candidate_tmp",
+        )
+    chunk_directory = output.parent / f".{output.stem}_chunks"
+    assert len(list(chunk_directory.glob("*.parquet"))) == 1
+
+    monkeypatch.setattr(sparse_module, "sp_matmul_topn", original_matmul)
+    report = generate_sparse_name_candidates(
+        splits / "validation",
+        output,
+        tmp_path / "resumed_report.json",
+        config=config,
+        runtime=runtime,
+        temp_directory=tmp_path / "candidate_tmp",
+    )
+    assert report["positive_pair_recall"] == 1.0
+    assert output.is_file()
+    assert not chunk_directory.exists()

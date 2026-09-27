@@ -1,0 +1,58 @@
+# Selected after entity-group OOF comparison. The final numeric threshold is intentionally absent:
+# it must be tuned by the fit-only model on scale-matched tuning, then frozen for holdout/test.
+
+[validation]
+seed = 20260927
+fit_fraction_of_unused_train = 0.8888888888888888
+tuning_fraction_of_unused_train = 0.05555555555555555
+holdout_fraction_of_unused_train = 0.05555555555555555
+metric = "entity_macro_f0.5"
+cv_folds = 3
+scale_matched_target_distractors = true
+
+[rule_blocking]
+partition_by = ["country", "candidate_source", "query_batch"]
+top_k_per_source = 50
+max_key_document_frequency = 2000
+max_query_keys_per_source = 6
+minimum_token_length = 3
+query_batch_size = 50000
+
+[sparse_retrieval]
+method = "hashed_char_tfidf_name_address"
+top_k_per_source = 100
+ngram_min = 2
+ngram_max = 5
+n_features = 1048576
+minimum_similarity = 0.10
+address_weight = 0.35
+query_batch_size = 25000
+resume = true
+
+[hard_example_mining]
+mining_candidates_per_source = 20
+hard_negatives_per_source = 5
+random_negatives_per_source = 1
+model_hard_negatives_per_source = 10
+rounds_selected = 2
+
+[model]
+family = "lightgbm"
+learning_rate = 0.05
+n_estimators = 350
+num_leaves = 63
+min_child_samples = 40
+reg_lambda = 1.0
+calibration = "weighted_logistic_on_disjoint_bucket"
+
+[threshold_selection]
+strategy = "fit_only_model_on_scale_matched_tuning"
+grid_steps = 401
+segmentation = "global"
+source_specific_minimum_gain = 0.0001
+
+[complexity_guards]
+allow_neural_network = false
+force_one_match_per_query = false
+use_external_identity_data = false
+accepted_top_k_per_source = 100
