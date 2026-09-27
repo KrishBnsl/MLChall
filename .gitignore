@@ -2,6 +2,7 @@
 .idea/
 .vscode/
 .venv/
+.uv-cache/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -28,3 +29,7 @@ artifacts/*
 # Local experiment tracking.
 mlruns/
 wandb/
+
+# Official organizer bundle: retain the small documentation/validator, never raw data or outputs.
+student_resource/dataset/
+student_resource/output/

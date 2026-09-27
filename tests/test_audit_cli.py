@@ -5,9 +5,9 @@ import json
 import pandas as pd
 import pytest
 
-from mlchallenge.audit import audit_data
 from mlchallenge.cli import main
 from mlchallenge.contracts import ContractError, load_test_data, load_training_data
+from mlchallenge.large_data import DuckDBRuntime, audit_dataset_out_of_core
 from mlchallenge.submission import write_submission_files
 
 
@@ -17,11 +17,16 @@ def test_loaders_and_audit_report(dataset_root) -> None:
     assert len(training.source1) == 4
     assert len(test.source3) == 4
 
-    report = audit_data(dataset_root)
-    assert report["train"]["ground_truth"]["singleton_entities"] == 1
-    assert report["train"]["ground_truth"]["positive_pairs"] == 6
+    report = audit_dataset_out_of_core(
+        dataset_root,
+        temp_directory=dataset_root / "tmp",
+        runtime=DuckDBRuntime(memory_limit="256MB", threads=1, max_temp_directory_size="1GB"),
+    )
+    assert report["ground_truth"]["singleton_entities"] == 1
+    assert report["ground_truth"]["positive_pairs"] == 6
     assert len(report["files"]) == 7
     assert all(len(item["sha256"]) == 64 for item in report["files"].values())
+    assert report["contract_status"] == "PASS"
 
 
 def test_cli_audit_make_folds_and_preflight(dataset_root, tmp_path, capsys) -> None:
@@ -34,11 +39,19 @@ def test_cli_audit_make_folds_and_preflight(dataset_root, tmp_path, capsys) -> N
                 str(dataset_root),
                 "--output",
                 str(audit_path),
+                "--temp-directory",
+                str(tmp_path / "duckdb_tmp"),
+                "--memory-limit",
+                "256MB",
+                "--max-temp-size",
+                "1GB",
+                "--threads",
+                "1",
             ]
         )
         == 0
     )
-    assert json.loads(audit_path.read_text())["audit_version"] == 1
+    assert json.loads(audit_path.read_text())["audit_version"] == 2
 
     manifest_path = tmp_path / "artifacts" / "folds.tsv"
     assert (
